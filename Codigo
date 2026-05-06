@@ -1,0 +1,281 @@
+from machine import Pin, I2C, PWM
+import ssd1306
+import time
+import urandom
+import framebuf
+
+# CONFIG
+WIDTH = 128
+HEIGHT = 64
+BTN_UP = Pin(12, Pin.IN, Pin.PULL_UP)
+BTN_DOWN = Pin(14, Pin.IN, Pin.PULL_UP)
+BTN_START = Pin(27, Pin.IN, Pin.PULL_UP)
+buzzer = PWM(Pin(25), duty=0)
+i2c = I2C(0, scl=Pin(22), sda=Pin(21))
+oled = ssd1306.SSD1306_I2C(WIDTH, HEIGHT, i2c)
+
+# SPRITES
+
+player_sprite = bytearray([
+    0x66,0x24,0x3C,0xFF,0xDB,0x7E,0x3C,0x18
+])
+
+alien_sprite = bytearray([
+    0x3C,0x7E,0xDB,0xFF,0x24,0x5A,0xA5,0x42
+])
+
+# ESTADOS
+
+STATE_MENU = 0
+STATE_GAME = 1
+STATE_PAUSE = 2
+STATE_GAME_OVER = 3
+
+MODES = ["CLASICO", "TIME", "HARDCORE"]
+
+# VARIABLES
+
+state = STATE_MENU
+mode_index = 0
+
+player_y = HEIGHT // 2
+obstacles = []
+
+score_time = 0
+score_dodge = 0
+
+start_time = 0
+last_spawn = 0
+
+speed = 2
+spawn_rate = 1200
+
+victory = False 
+
+# SONIDO
+
+def beep(freq=1000, duration=50):
+    buzzer.freq(freq)
+    buzzer.duty(200)
+    time.sleep_ms(duration)
+    buzzer.duty(0)
+
+def chirp():
+    for f in range(800, 1200, 80):
+        buzzer.freq(f)
+        buzzer.duty(200)
+        time.sleep_ms(10)
+    buzzer.duty(0)
+
+# INPUT
+
+def pressed(pin):
+    return pin.value() == 0
+
+# COLISION
+
+def collide(x1,y1,x2,y2):
+    return not (x1+8 < x2 or x1 > x2+8 or y1+8 < y2 or y1 > y2+8)
+
+# SPAWN
+
+def spawn_obstacle():
+    y = urandom.getrandbits(6) % (HEIGHT-8)
+    obstacles.append({"x": WIDTH, "y": y})
+
+# RESET
+
+def reset_game():
+    global obstacles, score_time, score_dodge
+    global start_time, speed, spawn_rate, victory
+
+    obstacles = []
+    score_time = 0
+    score_dodge = 0
+    start_time = time.ticks_ms()
+    victory = False
+
+    if MODES[mode_index] == "HARDCORE":
+        speed = 5
+        spawn_rate = 500
+    else:
+        speed = 2
+        spawn_rate = 1200
+
+# UPDATE GAME
+
+def update_game():
+    global player_y, obstacles
+    global score_time, score_dodge
+    global last_spawn, speed, spawn_rate, victory
+
+    now = time.ticks_ms()
+
+    # INPUT
+    if pressed(BTN_UP):
+        player_y -= 2
+    if pressed(BTN_DOWN):
+        player_y += 2
+
+    player_y = max(0, min(HEIGHT-8, player_y))
+
+    # TIEMPO
+    score_time = (now - start_time) // 1000
+
+    # MODO TIME (30s)
+
+    if MODES[mode_index] == "TIME" and score_time >= 30:
+        victory = True
+        return True
+
+    # SPAWN
+    if time.ticks_diff(now, last_spawn) > spawn_rate:
+        spawn_obstacle()
+        last_spawn = now
+
+    # MOVER
+    for o in obstacles:
+        o["x"] -= speed
+
+    # LIMPIAR + SCORE
+    new_obs = []
+    for o in obstacles:
+        if o["x"] > -8:
+            new_obs.append(o)
+        else:
+            score_dodge += 1
+            beep(1500, 15)
+    obstacles = new_obs
+
+    # COLISION (SIEMPRE PIERDE)
+    for o in obstacles:
+        if collide(10, player_y, o["x"], o["y"]):
+            victory = False
+            return True
+
+
+    elapsed = score_time
+
+    if MODES[mode_index] == "CLASICO":
+        speed = 2 + (elapsed * 0.05)
+        spawn_rate = max(300, 1200 - (elapsed * 10))
+
+    elif MODES[mode_index] == "TIME":
+        speed = 2 + (elapsed * 0.08)
+        spawn_rate = max(250, 1000 - (elapsed * 15))
+
+    elif MODES[mode_index] == "HARDCORE":
+        speed = 5 + (elapsed * 0.1)
+        spawn_rate = max(200, 700 - (elapsed * 20))
+
+    return False
+
+# RENDER
+
+def draw_game():
+    oled.fill(0)
+
+    fb_player = framebuf.FrameBuffer(player_sprite, 8, 8, framebuf.MONO_VLSB)
+    oled.blit(fb_player, 10, player_y)
+
+    fb_alien = framebuf.FrameBuffer(alien_sprite, 8, 8, framebuf.MONO_VLSB)
+
+    for o in obstacles:
+        oled.blit(fb_alien, int(o["x"]), int(o["y"]))
+
+    total = score_time + score_dodge
+
+    oled.text("S:"+str(total), 0, 0)
+    oled.text("T:"+str(score_time), 45, 0)
+    oled.text("D:"+str(score_dodge), 90, 0)
+
+    if MODES[mode_index] == "TIME":
+        remaining = max(0, 30 - score_time)
+        oled.text(str(remaining)+"s", 45, 55)
+
+    oled.text(MODES[mode_index], 0, 55)
+
+    oled.show()
+
+# MENU
+
+def draw_menu():
+    oled.fill(0)
+    oled.text("SPACE EVADE", 20, 5)
+
+    for i,m in enumerate(MODES):
+        prefix = ">" if i==mode_index else " "
+        oled.text(prefix+m, 30, 20+i*10)
+
+    oled.show()
+
+# LOOP
+
+while True:
+
+    if state == STATE_MENU:
+        draw_menu()
+
+        if pressed(BTN_UP):
+            mode_index = (mode_index-1)%len(MODES)
+            chirp()
+            time.sleep_ms(200)
+
+        if pressed(BTN_DOWN):
+            mode_index = (mode_index+1)%len(MODES)
+            chirp()
+            time.sleep_ms(200)
+
+        if pressed(BTN_START):
+            reset_game()
+            state = STATE_GAME
+            beep(1200,100)
+            time.sleep_ms(300)
+
+    elif state == STATE_GAME:
+
+        if pressed(BTN_START):
+            state = STATE_PAUSE
+            beep(800,100)
+            time.sleep_ms(300)
+
+        if update_game():
+            state = STATE_GAME_OVER
+            if victory:
+                beep(1800,200)
+            else:
+                beep(200,400)
+
+        draw_game()
+
+    elif state == STATE_PAUSE:
+        oled.fill(0)
+        oled.text("PAUSA",40,30)
+        oled.show()
+
+        if pressed(BTN_START):
+            state = STATE_GAME
+            beep(1000,100)
+            time.sleep_ms(300)
+
+    elif state == STATE_GAME_OVER:
+        oled.fill(0)
+
+        total = score_time + score_dodge
+
+        if victory and MODES[mode_index] == "TIME":
+            oled.text("YOU WIN!", 25, 15)
+        else:
+            oled.text("GAME OVER", 20, 15)
+
+        oled.text("Score:"+str(total),20,30)
+        oled.text("T:"+str(score_time),20,45)
+        oled.text("D:"+str(score_dodge),70,45)
+
+        oled.show()
+
+        if pressed(BTN_START):
+            state = STATE_MENU
+            time.sleep_ms(300)
+
+    time.sleep_ms(30)
